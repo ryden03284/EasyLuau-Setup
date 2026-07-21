@@ -72,7 +72,7 @@ model.generation_config.temperature = 0.85
 model.generation_config.do_sample = True
 
 # 2. DATASET STREAMING
-dataset = load_dataset("json", data_files="grpo.jsonl", split="train")
+dataset = load_dataset("json", data_files="dataset.jsonl", split="train")
 
 SYSTEM_PROMPT = (
     "You are a helpful Roblox Luau assistant named LuauBot made by divinerblx. You must map out "
