@@ -6,6 +6,7 @@ os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"
 
 import re
 import subprocess
+import sys
 import tempfile
 import urllib.request
 import shutil
@@ -16,6 +17,10 @@ from unsloth import FastLanguageModel
 import torch
 from datasets import load_dataset
 from trl import GRPOConfig, GRPOTrainer
+
+
+def warn(message):
+    print(f"[WARN] {message}", file=sys.stderr, flush=True)
 
 
 # 0. SYSTEM PRE-FLIGHT CHECKS
@@ -29,10 +34,25 @@ ROBLOX_DEFS_URL = "https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/mast
 
 if not os.path.exists(ROBLOX_DEFS_PATH):
     print(f"{ROBLOX_DEFS_PATH} not found, downloading official Roblox definitions...")
+    # Download to a sibling temp file and rename only on success, so an aborted
+    # or truncated download never leaves a half-written definitions file that
+    # later runs would silently accept as valid.
+    _defs_dir = os.path.dirname(ROBLOX_DEFS_PATH) or "."
+    _fd, _tmp_defs_path = tempfile.mkstemp(dir=_defs_dir, suffix=".d.luau.part")
+    os.close(_fd)
     try:
-        urllib.request.urlretrieve(ROBLOX_DEFS_URL, ROBLOX_DEFS_PATH)
+        urllib.request.urlretrieve(ROBLOX_DEFS_URL, _tmp_defs_path)
+        if os.path.getsize(_tmp_defs_path) == 0:
+            raise RuntimeError(f"downloaded definitions from {ROBLOX_DEFS_URL} are empty")
+        os.replace(_tmp_defs_path, ROBLOX_DEFS_PATH)
     except Exception as e:
-        raise RuntimeError(f"[CRITICAL] Could not download definitions: {e}")
+        raise RuntimeError(f"[CRITICAL] Could not download definitions: {e}") from e
+    finally:
+        if os.path.exists(_tmp_defs_path):
+            try:
+                os.remove(_tmp_defs_path)
+            except OSError as cleanup_error:
+                warn(f"could not remove partial download {_tmp_defs_path}: {cleanup_error}")
 else:
     print(f"[INFO] Using Roblox definitions at: {ROBLOX_DEFS_PATH}")
 
@@ -104,12 +124,28 @@ _total = len(dataset)
 dataset = dataset.map(format_conversational, num_proc=os.cpu_count() or 1)
 
 print(f"[INFO] Boilerplate stripped cleanly for {_matched}/{_total} rows.")
+if _matched < _total:
+    # Non-matching rows fall back to the full raw prompt, which silently trains
+    # the model on boilerplate. Surface it instead of hiding it in a stat line.
+    warn(
+        f"{_total - _matched}/{_total} dataset rows had no 'Task:' header; "
+        "their full raw prompt is being used verbatim."
+    )
 
 
 # 3. EXTRACTION & REWARDS
 def safe_get_text(completion):
     if isinstance(completion, list) and len(completion) > 0:
-        return completion[-1].get("content", "")
+        last = completion[-1]
+        if not isinstance(last, dict):
+            raise TypeError(
+                f"expected the last completion message to be a dict, got {type(last).__name__}"
+            )
+        if "content" not in last:
+            raise KeyError(
+                f"completion message is missing a 'content' key (keys: {sorted(last)})"
+            )
+        return last["content"]
     return str(completion)
 
 CODE_FENCE_RE = re.compile(r'```(?:lua|luau)\s*\n(.*?)```', re.DOTALL | re.IGNORECASE)
@@ -151,6 +187,15 @@ def think_format_reward_func(completions, **kwargs):
             rewards.append(0.0)
     return rewards
 
+def _remove_temp(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        warn(f"could not remove temp file {path}: {e}")
+
+
 def _evaluate_single_completion(completion):
     """Runs the disk-write + luau-lsp subprocess check for exactly one completion.
     Pulled out of luau_syntax_reward_func so it can be fanned out across threads —
@@ -164,9 +209,15 @@ def _evaluate_single_completion(completion):
 
     is_trivial = len(code_clean.split('\n')) < 3 and not ("function" in code_clean or "if" in code_clean)
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.luau', delete=False, encoding='utf-8') as f:
-        f.write(code)
-        path = f.name
+    fd, path = tempfile.mkstemp(suffix='.luau')
+    try:
+        with os.fdopen(fd, mode='w', encoding='utf-8') as f:
+            f.write(code)
+    except Exception:
+        # The fd is already consumed by fdopen, so only the path needs cleanup;
+        # a failure to stage the file is a real bug, so let it propagate.
+        _remove_temp(path)
+        raise
 
     try:
         res = subprocess.run(
@@ -198,12 +249,20 @@ def _evaluate_single_completion(completion):
                 # enough to guarantee that at low issue_count, so clamp here.
                 continuous_score = min(continuous_score * 0.5, 0.15)
             return round(continuous_score, 4)
-    except Exception as e:
-        print(f"[WARN] luau-lsp invocation failed: {e}")
+    except subprocess.TimeoutExpired:
+        # A completion that hangs the analyzer is a property of the completion,
+        # so score it 0.0 rather than aborting the whole training step.
+        warn(f"luau-lsp timed out after 5s while analyzing {path}; scoring 0.0")
         return 0.0
+    except OSError as e:
+        # The binary vanished / is not executable / the OS refused to spawn it:
+        # every subsequent completion would score 0.0 and quietly poison the
+        # reward signal, so fail loudly instead.
+        raise RuntimeError(
+            f"[CRITICAL] Could not execute '{LUAU_ANALYZE_BIN}': {e}"
+        ) from e
     finally:
-        if os.path.exists(path):
-            os.remove(path)
+        _remove_temp(path)
 
 
 def luau_syntax_reward_func(completions, **kwargs):
@@ -328,10 +387,19 @@ FastLanguageModel.for_training(model)
 # START TRAINING FROM CHECKPOINT
 # ==========================================
 checkpoint_path = None
-if os.path.exists(training_args.output_dir):
+if os.path.isdir(training_args.output_dir):
+    try:
+        _entries = os.listdir(training_args.output_dir)
+    except OSError as e:
+        # Silently starting from scratch here would throw away hours of training,
+        # so an unreadable output dir must stop the run.
+        raise RuntimeError(
+            f"[CRITICAL] Could not scan '{training_args.output_dir}' for checkpoints: {e}"
+        ) from e
+
     checkpoints = [
-        os.path.join(training_args.output_dir, d) 
-        for d in os.listdir(training_args.output_dir) 
+        os.path.join(training_args.output_dir, d)
+        for d in _entries
         if d.startswith("checkpoint-") and d.split("-")[-1].isdigit()
     ]
     if checkpoints:
