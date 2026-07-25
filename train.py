@@ -4,6 +4,7 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_HUB_ETAG_TIMEOUT"] = "120"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"
 
+import functools
 import re
 import subprocess
 import tempfile
@@ -113,50 +114,64 @@ def safe_get_text(completion):
     return str(completion)
 
 CODE_FENCE_RE = re.compile(r'```(?:lua|luau)\s*\n(.*?)```', re.DOTALL | re.IGNORECASE)
+THINK_BLOCK_RE = re.compile(r'<think>(.*?)</think>', re.DOTALL | re.IGNORECASE)
+UNCLOSED_THINK_RE = re.compile(r'<think>.*', re.DOTALL | re.IGNORECASE)
 
 def strip_think_block(text):
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<think>.*', '', text, flags=re.DOTALL | re.IGNORECASE)
-    return text
+    return UNCLOSED_THINK_RE.sub('', THINK_BLOCK_RE.sub('', text))
+
+def visible_text(completion):
+    """Assistant text of a completion with the <think> reasoning removed."""
+    return strip_think_block(safe_get_text(completion))
+
+def code_from_visible_text(clean_text):
+    """First fenced Luau block of an already think-stripped text, or ""."""
+    match = CODE_FENCE_RE.search(clean_text)
+    return match.group(1).strip() if match else ""
 
 def extract_luau_code(completion_text):
-    clean_text = strip_think_block(completion_text)
-    match = CODE_FENCE_RE.search(clean_text)
-    if match:
-        return match.group(1).strip()
-    return ""
+    return code_from_visible_text(strip_think_block(completion_text))
 
-def code_fence_reward_func(completions, **kwargs):
-    rewards = []
-    for completion in completions:
-        text = strip_think_block(safe_get_text(completion))
-        fence_count = len(CODE_FENCE_RE.findall(text))
-        if fence_count == 1:
-            rewards.append(1.0)
-        elif fence_count > 1:
-            rewards.append(0.2)
-        else:
-            rewards.append(0.0)
-    return rewards
+def per_completion_reward(parallel=False):
+    """Turn a scorer of a single completion into a TRL reward function.
 
-def think_format_reward_func(completions, **kwargs):
-    rewards = []
-    for completion in completions:
-        text = safe_get_text(completion)
-        match = re.search(r'<think>(.*?)</think>', text, re.DOTALL | re.IGNORECASE)
-        # PENALIZE LAZY THINKING: Requires at least 150 characters of thought logic.
-        if match and len(match.group(1).strip()) >= 150 and re.search(r'[a-zA-Z0-9]', match.group(1)):
-            rewards.append(1.0)
-        else:
-            rewards.append(0.0)
-    return rewards
-
-def _evaluate_single_completion(completion):
-    """Runs the disk-write + luau-lsp subprocess check for exactly one completion.
-    Pulled out of luau_syntax_reward_func so it can be fanned out across threads —
+    Every reward function here scores completions independently, so the
+    list-building loop lives once in here. With parallel=True the scorer is
+    fanned out across threads, which is what the luau-lsp check needs:
     subprocess.run() releases the GIL while blocked on the child process, so
-    ThreadPoolExecutor gives real concurrency here without needing multiprocessing."""
-    code = extract_luau_code(safe_get_text(completion))
+    ThreadPoolExecutor gives real concurrency without multiprocessing."""
+    def decorator(score_fn):
+        @functools.wraps(score_fn)
+        def reward_func(completions, **kwargs):
+            if not parallel:
+                return [score_fn(completion) for completion in completions]
+            max_workers = min(len(completions), os.cpu_count() or 4) or 1
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                return list(executor.map(score_fn, completions))
+        return reward_func
+    return decorator
+
+@per_completion_reward()
+def code_fence_reward_func(completion):
+    fence_count = len(CODE_FENCE_RE.findall(visible_text(completion)))
+    if fence_count == 1:
+        return 1.0
+    if fence_count > 1:
+        return 0.2
+    return 0.0
+
+@per_completion_reward()
+def think_format_reward_func(completion):
+    match = THINK_BLOCK_RE.search(safe_get_text(completion))
+    # PENALIZE LAZY THINKING: Requires at least 150 characters of thought logic.
+    if match and len(match.group(1).strip()) >= 150 and re.search(r'[a-zA-Z0-9]', match.group(1)):
+        return 1.0
+    return 0.0
+
+@per_completion_reward(parallel=True)
+def luau_syntax_reward_func(completion):
+    """Runs the disk-write + luau-lsp static analysis check for one completion."""
+    code = code_from_visible_text(visible_text(completion))
     code_clean = re.sub(r'--.*', '', code).strip()
 
     if len(code_clean) < 15 or not re.search(r'\b(local|function|if|for|while|return|table\.|task\.)\b', code_clean):
@@ -206,50 +221,35 @@ def _evaluate_single_completion(completion):
             os.remove(path)
 
 
-def luau_syntax_reward_func(completions, **kwargs):
-    # PARALLELIZED: each completion's tempfile-write + luau-lsp subprocess call
-    # is independent I/O-bound work, so run them concurrently across threads
-    # instead of blocking the GPU step on 16 sequential shell-outs.
-    max_workers = min(len(completions), os.cpu_count() or 4) or 1
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        rewards = list(executor.map(_evaluate_single_completion, completions))
-    return rewards
+@per_completion_reward()
+def no_explanation_reward_func(completion):
+    clean_text = visible_text(completion)
 
-def no_explanation_reward_func(completions, **kwargs):
-    rewards = []
-    for completion in completions:
-        text = safe_get_text(completion)
-        clean_text = strip_think_block(text)
+    fence_match = CODE_FENCE_RE.search(clean_text)
+    if fence_match:
+        before = clean_text[:fence_match.start()].strip()
+        after = clean_text[fence_match.end():].strip()
+        outside_len = len(before) + len(after)
+        code = fence_match.group(1).strip()
+    else:
+        outside_len = len(clean_text.strip())
+        code = ""
 
-        fence_match = CODE_FENCE_RE.search(clean_text)
-        outside_len = 0
-        
-        if fence_match:
-            before = clean_text[:fence_match.start()].strip()
-            after = clean_text[fence_match.end():].strip()
-            outside_len = len(before) + len(after)
-        else:
-            outside_len = len(clean_text.strip())
+    if outside_len <= 25:
+        explanation_penalty = 0.0
+    else:
+        explanation_penalty = min(1.0, (outside_len - 25) / 200)
 
-        if outside_len <= 25:
-            explanation_penalty = 0.0
-        else:
-            explanation_penalty = min(1.0, (outside_len - 25) / 200)
+    lines = code.strip().split('\n') if code else []
+    comment_lines = sum(1 for line in lines if line.strip().startswith('--'))
 
-        code = extract_luau_code(text)
-        lines = code.strip().split('\n') if code else []
-        comment_lines = sum(1 for line in lines if line.strip().startswith('--'))
-        
-        comment_penalty = 0.0
-        if len(lines) > 4:
-            comment_ratio = comment_lines / len(lines)
-            if comment_ratio > 0.55:
-                comment_penalty = 0.5
+    comment_penalty = 0.0
+    if len(lines) > 4:
+        comment_ratio = comment_lines / len(lines)
+        if comment_ratio > 0.55:
+            comment_penalty = 0.5
 
-        total_penalty = max(-1.0, -(explanation_penalty + comment_penalty))
-        rewards.append(round(total_penalty, 4))
-        
-    return rewards
+    return round(max(-1.0, -(explanation_penalty + comment_penalty)), 4)
 
 # 4. CONFIGURATION
 
