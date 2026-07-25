@@ -4,6 +4,8 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_HUB_ETAG_TIMEOUT"] = "120"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"
 
+import atexit
+import hashlib
 import re
 import subprocess
 import tempfile
@@ -25,15 +27,47 @@ if not shutil.which(LUAU_ANALYZE_BIN):
 
 # FIX: local filename now matches the source file's real extension (.d.luau, not .d.lua)
 ROBLOX_DEFS_PATH = os.path.abspath("globalTypes.d.luau")
-ROBLOX_DEFS_URL = "https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/master/scripts/globalTypes.d.luau"
+# Pinned to an immutable release tag with a known digest: a mutable branch ref
+# lets upstream changes (or a tampered response) silently alter the definitions
+# every training run consumes.
+ROBLOX_DEFS_REF = "1.69.0"
+ROBLOX_DEFS_URL = (
+    f"https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/{ROBLOX_DEFS_REF}"
+    "/scripts/globalTypes.d.luau"
+)
+ROBLOX_DEFS_SHA256 = "7db9cd4fe55a4d26f3f7d5a39b6279a376f95a6c055c71d5591c26a1d525aaf2"
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 if not os.path.exists(ROBLOX_DEFS_PATH):
     print(f"{ROBLOX_DEFS_PATH} not found, downloading official Roblox definitions...")
+    download_path = ROBLOX_DEFS_PATH + ".part"
     try:
-        urllib.request.urlretrieve(ROBLOX_DEFS_URL, ROBLOX_DEFS_PATH)
+        urllib.request.urlretrieve(ROBLOX_DEFS_URL, download_path)
+        actual_digest = sha256_file(download_path)
+        if actual_digest != ROBLOX_DEFS_SHA256:
+            raise RuntimeError(
+                f"definition digest mismatch: expected {ROBLOX_DEFS_SHA256}, got {actual_digest}"
+            )
+        os.replace(download_path, ROBLOX_DEFS_PATH)
     except Exception as e:
+        if os.path.exists(download_path):
+            os.remove(download_path)
         raise RuntimeError(f"[CRITICAL] Could not download definitions: {e}")
 else:
+    local_digest = sha256_file(ROBLOX_DEFS_PATH)
+    if local_digest != ROBLOX_DEFS_SHA256:
+        print(
+            f"[WARN] {ROBLOX_DEFS_PATH} does not match the pinned digest "
+            f"({local_digest} != {ROBLOX_DEFS_SHA256}); delete it to re-download."
+        )
     print(f"[INFO] Using Roblox definitions at: {ROBLOX_DEFS_PATH}")
 
 torch.cuda.empty_cache()
@@ -151,6 +185,13 @@ def think_format_reward_func(completions, **kwargs):
             rewards.append(0.0)
     return rewards
 
+# Model completions are untrusted text. Stage them in a private 0700 directory
+# rather than shared world-readable /tmp, so other local users can neither read
+# nor swap the files handed to luau-lsp.
+SANDBOX_DIR = tempfile.mkdtemp(prefix="luau_grpo_eval_")
+atexit.register(shutil.rmtree, SANDBOX_DIR, True)
+
+
 def _evaluate_single_completion(completion):
     """Runs the disk-write + luau-lsp subprocess check for exactly one completion.
     Pulled out of luau_syntax_reward_func so it can be fanned out across threads —
@@ -164,7 +205,9 @@ def _evaluate_single_completion(completion):
 
     is_trivial = len(code_clean.split('\n')) < 3 and not ("function" in code_clean or "if" in code_clean)
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.luau', delete=False, encoding='utf-8') as f:
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix='.luau', delete=False, encoding='utf-8', dir=SANDBOX_DIR
+    ) as f:
         f.write(code)
         path = f.name
 
