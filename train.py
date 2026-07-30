@@ -43,7 +43,6 @@ max_seq_length = 4096
 base_model_name = "luau_grpo_final_clean"
 
 print(f"[INFO] Loading model: {base_model_name}")
-print("🧠 QUALITY OVERRIDE: Loading native unquantized weights...")
 
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=base_model_name,
@@ -62,7 +61,7 @@ model = FastLanguageModel.get_peft_model(
     ],                   
     lora_dropout=0,
     bias="none",
-    use_gradient_checkpointing="unsloth",
+    use_gradient_checkpointing=True,
     random_state=3407,
 )
 
